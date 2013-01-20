@@ -40,7 +40,8 @@
             "File::Temp" : "0",
             "Test::BinaryData" : "0",
             "Test::Differences" : "0",
-            "Test::More" : "0.96"
+            "Test::More" : "0.96",
+            "utf8" : "0"
          }
       }
    },
@@ -53,7 +54,7 @@
          "web" : "https://github.com/rjbs/ZSCII"
       }
    },
-   "version" : "0.001",
+   "version" : "0.002",
    "x_Dist_Zilla" : {
       "perl" : {
          "version" : "5.017007"

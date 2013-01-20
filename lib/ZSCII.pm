@@ -1,6 +1,6 @@
 package ZSCII;
 {
-  $ZSCII::VERSION = '0.001';
+  $ZSCII::VERSION = '0.002';
 }
 use strict;
 use warnings;
@@ -19,7 +19,7 @@ ZSCII - libraries for dealing with Z-Machine text
 
 =head1 VERSION
 
-version 0.001
+version 0.002
 
 =head1 OVERVIEW
 

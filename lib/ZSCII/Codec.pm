@@ -1,6 +1,6 @@
 package ZSCII::Codec;
 {
-  $ZSCII::Codec::VERSION = '0.001';
+  $ZSCII::Codec::VERSION = '0.002';
 }
 use 5.14.0;
 use warnings;
@@ -10,23 +10,159 @@ use Carp ();
 use charnames ();
 
 
+my %DEFAULT_ZSCII = (
+  chr(0x00) => "\N{NULL}",
+  chr(0x08) => "\N{DELETE}",
+  chr(0x0D) => "\x0D",
+  chr(0x1B) => "\N{ESCAPE}",
+
+  (map {; chr $_ => chr $_ } (0x20 .. 0x7E)), # ASCII maps over
+
+  # 0x09B - 0x0FB are the "extra characters" and need Unicode translation table
+  # 0x0FF - 0x3FF are undefined and never (?) used
+);
+
+# We can use these characters below because they all (save for the magic A2-C6)
+# are the same in Unicode/ASCII/ZSCII. -- rjbs, 2013-01-18
+my $DEFAULT_ALPHABET = join(q{},
+  'a' .. 'z', # A0
+  'A' .. 'Z', # A1
+  (           # A2
+    "\0", # special: read 2 chars for 10-bit zscii character
+    "\x0D",
+    (0 .. 9),
+    do { no warnings 'qw'; qw[ . , ! ? _ # ' " / \ - : ( ) ] },
+  ),
+);
+
+my @DEFAULT_EXTRA = map chr hex, qw(
+  E4 F6 FC C4 D6 DC DF BB       AB EB EF FF CB CF E1 E9
+  ED F3 FA FD C1 C9 CD D3       DA DD E0 E8 EC F2 F9 C0
+  C8 CC D2 D9
+
+  E2 EA EE F4 FB C2 CA CE       D4 DB E5 C5 F8 D8 E3 F1
+  F5 C3 D1 D5 E6 C6 E7 C7       FE F0 DE D0 A3 153 152 A1
+  BF
+);
+
+sub _validate_alphabet {
+  my (undef, $alphabet) = @_;
+
+  Carp::croak("alphabet table was not 78 entries long")
+    unless length $alphabet == 78;
+
+  Carp::carp("alphabet character 52 not set to 0x000")
+    unless substr($alphabet, 52, 1) eq chr(0);
+
+  Carp::croak("alphabet table contains characters over 0xFF")
+    if grep {; ord > 0xFF } split //, $alphabet;
+}
+
+sub _shortcuts_for {
+  my ($self, $alphabet) = @_;
+
+  $self->_validate_alphabet($alphabet);
+
+  my %shortcut = (q{ } => chr(0));
+
+  for my $i (0 .. 2) {
+    my $offset = $i * 26;
+    my $prefix = $i ? chr(0x03 + $i) : '';
+
+    for my $j (0 .. 25) {
+      next if $i == 2 and $j == 0; # that guy is magic! -- rjbs, 2013-01-18
+
+      $shortcut{ substr($alphabet, $offset + $j, 1) } = $prefix . chr($j + 6);
+    }
+  }
+
+  return \%shortcut;
+}
+
 
 sub new {
   my ($class, $arg) = @_;
 
-  my $guts;
   if (! defined $arg) {
-    $guts = { version => 5 };
+    $arg = { version => 5 };
   } if (! ref $arg) {
-    $guts = { version => $arg };
-  } else {
-    $guts = $arg;
+    $arg = { version => $arg };
   }
 
-  Carp::croak("only Version 5 ZSCII is supported at present")
-    unless $guts->{version} == 5;
+  my $guts = { version => $arg->{version} };
 
-  return bless $guts => $class;
+  Carp::croak("only Version 5, 7, and 8 ZSCII are supported at present")
+    unless $guts->{version} == 5
+        or $guts->{version} == 7
+        or $guts->{version} == 8;
+
+  $guts->{zscii} = { %DEFAULT_ZSCII };
+
+  # Why is this an arrayref and not, like alphabets, a string?
+  # Alphabets are strings because they're guaranteed to fit in bytestrings.
+  # You can't put a ZSCII character over 0xFF in the alphabet, because it can't
+  # be put in the story file's alphabet table!  By using a string, it's easy to
+  # just pass in the alphabet from memory to/from the codec.  On the other
+  # hand, the Unicode translation table stores Unicode codepoint values packed
+  # into words, and it's not a good fit for use in the codec.  Maybe a
+  # ZSCII::Util will be useful for packing/unpacking Unicode translation
+  # tables.
+  $guts->{extra} = $arg->{extra_characters}
+                || \@DEFAULT_EXTRA;
+
+  Carp::confess("Unicode translation table exceeds maximum length of 97")
+    if @{ $guts->{extra} } > 97;
+
+  for (0 .. $#{ $guts->{extra} }) {
+    Carp::confess("tried to add ambiguous Z->U mapping")
+      if exists $guts->{zscii}{ chr(155 + $_) };
+
+    my $u_char = $guts->{extra}[$_];
+
+    # Extra characters must go into the Unicode substitution table, which can
+    # only represent characters with codepoints between 0 and 0xFFFF.  See
+    # Z-Machine Spec v1.1 § 3.8.4.2.1
+    Carp::confess("tried to add Unicode codepoint greater than U+FFFF")
+      if ord($u_char) > 0xFFFF;
+
+    $guts->{zscii}{ chr(155 + $_) } = $u_char;
+  }
+
+  $guts->{zscii_for} = { };
+  for my $zscii_char (sort keys %{ $guts->{zscii} }) {
+    my $unicode_char = $guts->{zscii}{$zscii_char};
+
+    Carp::confess("tried to add ambiguous U->Z mapping")
+      if exists $guts->{zscii_for}{ $unicode_char };
+
+    $guts->{zscii_for}{ $unicode_char } = $zscii_char;
+  }
+
+  my $self = bless $guts => $class;
+
+  # The default alphabet is entirely made up of characters that are the same in
+  # Unicode and ZSCII.  If a user wants to put "extra characters" into the
+  # alphabet table, though, the alphabet should contain ZSCII values.  When
+  # we're building a ZSCII::Codec using the contents of the story file's
+  # alphabet table, that's easy.  If we're building a codec to *produce* a
+  # story file, it's less trivial, because we don't want to think about the
+  # specific ZSCII codepoints for the Unicode text we'll encode.
+  #
+  # We provide alphabet_is_unicode to let the user say "my alphabet is supplied
+  # in Unicode, please convert it to ZSCII during construction."
+  # -- rjbs, 2013-01-19
+  my $alphabet = $arg->{alphabet} || $DEFAULT_ALPHABET;
+
+  # It's okay if the user supplies alphabet_is_unicode but not alphabet,
+  # because the default alphabet is all characters with the same value in both
+  # character sets! -- rjbs, 2013-01-20
+  $alphabet = $self->unicode_to_zscii($alphabet)
+    if $arg->{alphabet_is_unicode};
+
+  $self->{alphabet} = $alphabet;
+  $self->{shortcut} = $class->_shortcuts_for( $self->{alphabet} );
+
+  return $self;
 }
 
 
@@ -54,41 +190,6 @@ sub decode {
   return $unicode;
 }
 
-my %ZSCII_FOR = (
-  "\N{NULL}"   => chr 0x00,
-  "\N{DELETE}" => chr 0x08,
-  "\x0D"       => chr 0x0D,
-  "\N{ESCAPE}" => chr 0x1B,
-
-  (map {; chr $_ => chr $_ } (0x20 .. 0x7E)), # ASCII maps over
-
-  # 0x09B - 0x0FB are the "extra characters" and need alphabet table code
-  # 0x0FF - 0x3FF are undefined and never (?) used
-);
-
-my %UNICODE_FOR = reverse %ZSCII_FOR;
-
-# We can use these characters below because they all (save for the magic A2-C6)
-# are the same in Unicode/ASCII/ZSCII. -- rjbs, 2013-01-18
-my @ALPHABETS = (
-  [ 'a' .. 'z' ],
-  [ 'A' .. 'Z' ],
-  [ \0,     # special: read 2 chars for 10-bit zscii character
-    "\x0D",
-    (0 .. 9),
-    do { no warnings 'qw'; qw[ . , ! ? _ # ' " / \ - : ( ) ] },
-  ],
-);
-
-my %DEFAULT_SHORTCUT = (q{ } => chr(0));
-for my $i (0 .. 2) {
-  for my $j (0 .. $#{ $ALPHABETS[$i] }) {
-    next if $i == 2 and $j == 0; # that guy is magic! -- rjbs, 2013-01-18
-    $DEFAULT_SHORTCUT{ $ALPHABETS[$i][$j] }
-      = $i ? chr(0x03 + $i) . chr($j + 6) : chr($j + 6);
-  }
-}
-
 
 sub unicode_to_zscii {
   my ($self, $unicode_text) = @_;
@@ -101,7 +202,7 @@ sub unicode_to_zscii {
       sprintf "no ZSCII character available for Unicode U+%v05X <%s>",
         $char,
         charnames::viacode(ord $char),
-    ) unless my $zscii_char = $ZSCII_FOR{ $char };
+    ) unless defined( my $zscii_char = $self->{zscii_for}{ $char } );
 
     $zscii .= $zscii_char;
   }
@@ -119,7 +220,7 @@ sub zscii_to_unicode {
 
     Carp::croak(
       sprintf "no Unicode character available for ZSCII %#v05x", $char,
-    ) unless my $unicode_char = $UNICODE_FOR{ $char };
+    ) unless my $unicode_char = $self->{zscii}{ $char };
 
     $unicode .= $unicode_char;
   }
@@ -136,13 +237,12 @@ sub zscii_to_zchars {
   my $zchars = '';
   for (0 .. length($zscii) - 1) {
     my $zscii_char = substr($zscii, $_, 1);
-    if ($DEFAULT_SHORTCUT{ $zscii_char }) {
-      $zchars .= $DEFAULT_SHORTCUT{ $zscii_char };
+    if (defined (my $shortcut = $self->{shortcut}{ $zscii_char })) {
+      $zchars .= $shortcut;
       next;
     }
 
-    $zchars = "\x05\x06"; # The escape code for a ten-bit ZSCII character.
-    my $ord = ord $zscii;
+    my $ord = ord $zscii_char;
 
     if ($ord >= 1024) {
       Carp::croak(
@@ -154,6 +254,7 @@ sub zscii_to_zchars {
     my $top = ($ord & 0b1111100000) >> 5;
     my $bot = ($ord & 0b0000011111);
 
+    $zchars .= "\x05\x06"; # The escape code for a ten-bit ZSCII character.
     $zchars .= chr($top) . chr($bot);
   }
 
@@ -162,35 +263,37 @@ sub zscii_to_zchars {
 
 
 sub zchars_to_zscii {
-  my ($self, $zchars) = @_;
+  my ($self, $zchars, $arg) = @_;
+  $arg ||= {};
 
   my $text = '';
   my $alphabet = 0;
 
-  # We copy to avoid destroying our input.  That's just good manners.
-  # -- rjbs, 2013-01-18
-  while (length $zchars) {
-    my $char = substr $zchars, 0, 1, '';
-
-    last unless defined $char; # needed because of redo below
-
+  while (length( my $char = substr $zchars, 0, 1, '')) {
     my $ord = ord $char;
 
-    if ($ord eq 0) { $text .= q{ }; next; }
+    if ($ord == 0) { $text .= q{ }; next; }
 
-    if    ($ord == 0x04) { $alphabet = 1; redo }
-    elsif ($ord == 0x05) { $alphabet = 2; redo }
+    if    ($ord == 0x04) { $alphabet = 1; next }
+    elsif ($ord == 0x05) { $alphabet = 2; next }
 
     if ($alphabet == 2 && $ord == 0x06) {
       my $next_two = substr $zchars, 0, 2, '';
-      Carp::croak("ten-bit ZSCII encoding segment terminated early")
-        unless length $next_two == 2;
+      if (length $next_two != 2) {
+        last if $arg->{allow_early_termination};
+        Carp::croak("ten-bit ZSCII encoding segment terminated early")
+      }
 
-      Carp::croak("ten-bit ZSCII encoding not yet supported"); # TODO
+      my $value = ord(substr $next_two, 0, 1) << 5
+                | ord(substr $next_two, 1, 1);
+
+      $text .= chr $value;
+      $alphabet = 0;
+      next;
     }
 
     if ($ord >= 0x06 && $ord <= 0x1F) {
-      $text .= $ALPHABETS[ $alphabet ][ $ord - 6 ];
+      $text .= substr $self->{alphabet}, (26 * $alphabet) + $ord - 6, 1;
       $alphabet = 0;
       next;
     }
@@ -199,6 +302,17 @@ sub zchars_to_zscii {
   }
 
   return $text;
+}
+
+
+sub make_dict_length {
+  my ($self, $zchars) = @_;
+
+  my $length = $self->{version} >= 5 ? 9 : 6;
+  $zchars = substr $zchars, 0, $length;
+  $zchars .= "\x05" x ($length - length($zchars));
+
+  return $zchars;
 }
 
 
@@ -260,20 +374,13 @@ ZSCII::Codec - an encoder/decoder for Z-Machine text
 
 =head1 VERSION
 
-version 0.001
+version 0.002
 
 =head1 OVERVIEW
 
 ZSCII::Codec is a class for objects that are encoders/decoders of Z-Machine
-text.  Right now, ZSCII::Codec only implements Version 5, and even that
-partially.  Only the basic three alphabets are supported for encoding and
-decoding.  Three character sequences (i.e., full ten bit ZSCII characters) are
-not yet supported.  Alternate alphabet tables are not yet supported, nor are
-abbreviations.
-
-In the future, these will be supported, and it will be possible to map
-characters not found in Unicode.  For example, the ZSCII "sentence space" could
-be mapped to the Unicode "EM SPACE" character.
+text.  Right now, ZSCII::Codec only implements Version 5 (and thus 7 and 8),
+and even that partially.  There is no abbreviation support yet.
 
 =head2 How Z-Machine Text Works
 
@@ -294,7 +401,7 @@ string has its top bit set to mark the ending.  When a bytestring would end
 with out enough Z-characters to pack a full word, it is padded.  (ZSCII::Codec
 pads with Z-character 0x05, a shift character.)
 
-Later versions of the Z-machine allow the mapping of ZSCII codepoints to
+Later versions of the Z-Machine allow the mapping of ZSCII codepoints to
 Unicode codepoints to be customized.  ZSCII::Codec does not yet support this
 feature.
 
@@ -310,9 +417,51 @@ Z-character bytestrings.  All four forms are represented by Perl strings.
   my $z = ZSCII::Codec->new(\%arg);
   my $z = ZSCII::Codec->new($version);
 
-This returns a new codec.  The only valid argument is C<version>, which gives
-the version of Z-machine to target.  The default is 5.  If the only argument is
-a number, it will be used as the version to target.
+This returns a new codec.  If the only argument is a number, it is treated as a
+version specification.  If no arguments are given, a Version 5 codec is made.
+
+Valid named arguments are:
+
+=over 4
+
+=item version
+
+The number of the Z-Machine targeted; at present, only 5, 7, or 8 are permitted
+values.
+
+=item extra_characters
+
+This is a reference to an array of between 0 and 97 Unicode characters.  These
+will be the characters to which ZSCII characters 155 through 251.  They may not
+duplicate any characters represented by the default ZSCII set.  No Unicode
+codepoint above U+FFFF is permitted, as it would not be representable in the
+Z-Machine Unicode substitution table.
+
+If no extra characters are given, the default table is used.
+
+=item alphabet
+
+This is a string of 78 characters, representing the three 26-character
+alphabets used to encode ZSCII compactly into Z-characters.  The first 26
+characters are alphabet 0, for the most common characters.  The rest of the
+characters are alphabets 1 and 2.
+
+No character with a ZSCII value greater than 0xFF may be included in the
+alphabet.  Character 52 (A2's first character) should be NUL.
+
+If no alphabet is given, the default alphabet is used.
+
+=item alphabet_is_unicode
+
+By default, the values in the C<alphabet> are assumed to be ZSCII characters,
+so that the contents of the alphabet table from the Z-Machine's memory can be
+used directly.  The C<alphabet_is_unicode> option specifies that the characters
+in the alphabet string are Unicode characters.  They will be converted to ZSCII
+internally by the C<unicode_to_zscii> method, and if characters appear in the
+alphabet that are not in the default ZSCII set or the extra characters, an
+exception will be raised.
+
+=back
 
 =head2 encode
 
@@ -370,13 +519,37 @@ Z-characters, which should not be possible with legal ZSCII.
 
 =head2 zchars_to_zscii
 
-  my $zscii = $z->zchars_to_zscii( $zchars_string );
+  my $zscii = $z->zchars_to_zscii( $zchars_string, \%arg );
 
 Given a string of (unpacked) Z-characters, this method will return a string of
 ZSCII characters.
 
 It will raise an exception when the right thing to do can't be determined.
 Right now, that could mean lots of things.
+
+Valid arguments are:
+
+=over 4
+
+=item allow_early_termination
+
+If C<allow_early_termination> is true, no exception is thrown if the
+Z-character string ends in the middle of a four z-character sequence.  This is
+useful when dealing with dictionary words.
+
+=back
+
+=head2 make_dict_length
+
+  my $zchars = $z->make_dict_length( $zchars_string )
+
+This method returns the Z-character string fit to dictionary length for the
+Z-machine version being handled.  It will trim excess characters or pad with
+Z-character 5 to be the right length.
+
+When converting such strings back to ZSCII, you should pass the
+C<allow_early_termination> to C<zchars_to_zscii>, as a four-Z-character
+sequence may have been terminated early.
 
 =head2 pack_zchars
 

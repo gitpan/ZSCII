@@ -58,6 +58,7 @@ eval { $v .= pmver('Test::More','0.96') };
 eval { $v .= pmver('Test::Pod','1.41') };
 eval { $v .= pmver('charnames','any version') };
 eval { $v .= pmver('strict','any version') };
+eval { $v .= pmver('utf8','any version') };
 eval { $v .= pmver('version','0.9901') };
 eval { $v .= pmver('warnings','any version') };
 
